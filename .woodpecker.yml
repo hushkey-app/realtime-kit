@@ -1,0 +1,109 @@
+# Same flow as Pack: branch decides the target. dev → local registry (arm64),
+# main → Vultr (amd64). Scope: test, compile, package, push. Rollout happens
+# outside this pipeline — the stack just pulls the tag.
+when:
+  - event: [push, manual]
+    branch: [main, dev]
+
+variables:
+  - &docker_image docker:27
+  - &docker_volumes
+    - /var/run/docker.sock:/var/run/docker.sock
+  - &build_commands
+    - set -euo pipefail
+
+    - IMAGE="$REGISTRY/${CI_REPO_NAME}"
+    - NEW_SHA="${CI_COMMIT_SHA}"
+    # Written by `compile`, so the binary's --version and the image tag agree.
+    - VERSION="$(cat dist/VERSION)"
+
+    - echo "IMAGE=$IMAGE VERSION=$VERSION"
+
+    # NOTE: use only bare $VAR for non-CI vars anywhere in this file, comments
+    # included — Woodpecker rewrites every dollar-brace expression against its
+    # CI-only vars before the shell runs.
+    - |
+        if [ "$REGISTRY_AUTH" = "1" ]; then
+          if [ -z "$REGISTRY_USER" ] || [ -z "$REGISTRY_PASSWORD" ]; then
+            echo "ERROR: registry secrets are empty for $REGISTRY — check the Woodpecker secrets" >&2
+            exit 1
+          fi
+          echo "$REGISTRY_PASSWORD" | docker login "$(echo "$REGISTRY" | cut -d/ -f1)" -u "$REGISTRY_USER" --password-stdin
+        fi
+
+    # Dedicated buildkit container, for the same Harbor auth reason as Pack:
+    # the host daemon pushes anonymously and 401s.
+    - |
+        docker buildx inspect ci-pusher >/dev/null 2>&1 || \
+          docker buildx create --name ci-pusher --driver docker-container \
+            --driver-opt network=host --bootstrap
+    - |
+        for attempt in 1 2 3; do
+          echo "push attempt $attempt/3"
+          if docker build \
+            --builder ci-pusher \
+            --platform "$BUILD_PLATFORM" \
+            --label "org.opencontainers.image.revision=$NEW_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --provenance=false \
+            --sbom=false \
+            -f Dockerfile \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:$VERSION" \
+            --output "type=image,push=true" \
+            .; then
+            echo "pushed $IMAGE:$VERSION"
+            exit 0
+          fi
+          echo "push attempt $attempt failed" >&2
+          sleep 15
+        done
+        echo "ERROR: giving up after 3 push attempts" >&2
+        exit 1
+
+steps:
+  # Tests, then a static cross-compile. Go needs no emulation to target another
+  # arch, so this is seconds on either build host.
+  compile:
+    image: golang:1.26
+    environment:
+      CGO_ENABLED: "0"
+    commands:
+      - set -eu
+      - go vet ./...
+      - go test ./...
+      # prod (main → Vultr VPS) is x86; dev builds native arm64 for the mac mini.
+      - if [ "${CI_COMMIT_BRANCH}" = "main" ]; then ARCH=amd64; else ARCH=arm64; fi
+      # release tag: build date/time (Australia/Perth), e.g. 190926-2300
+      - VERSION="$(TZ=Australia/Perth date +%d%m%y-%H%M)"
+      - mkdir -p dist && echo "$VERSION" > dist/VERSION
+      - echo "compiling realtime-kit $VERSION for linux/$ARCH"
+      - GOOS=linux GOARCH=$ARCH go build -trimpath -ldflags="-s -w -X main.version=$VERSION -X main.commit=${CI_COMMIT_SHA} -X main.builtAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o dist/realtime-kit .
+
+  build-local:
+    when:
+      - event: [push, manual]
+        branch: dev
+    image: *docker_image
+    volumes: *docker_volumes
+    environment:
+      REGISTRY: localhost:9011
+      REGISTRY_AUTH: "0"
+      BUILD_PLATFORM: linux/arm64
+    commands: *build_commands
+
+  build-vultr:
+    when:
+      - event: [push, manual]
+        branch: main
+    image: *docker_image
+    volumes: *docker_volumes
+    environment:
+      REGISTRY: syd.vultrcr.com/hushkey
+      REGISTRY_AUTH: "1"
+      BUILD_PLATFORM: linux/amd64
+      REGISTRY_USER:
+        from_secret: vultr_registry_user
+      REGISTRY_PASSWORD:
+        from_secret: vultr_registry_password
+    commands: *build_commands

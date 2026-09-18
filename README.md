@@ -65,10 +65,31 @@ Durations accept either Go syntax (`10s`, `2m`) or a bare number of seconds.
 With no token set the service refuses to boot: an unauthenticated instance is a
 LiveKit token minter open to whoever can reach the port.
 
+### Beside Pack in a compose stack
+
+Woodpecker (`.woodpecker.yml`) tests, cross-compiles and pushes a distroless
+image on every push: `main` → `syd.vultrcr.com/hushkey/realtime-kit` (amd64),
+`dev` → the local registry (arm64). The machine running the stack only pulls it:
+
+```yaml
+  realtime-kit:
+    image: syd.vultrcr.com/hushkey/realtime-kit:latest
+    restart: unless-stopped
+    expose:
+      - "7890"                     # never `ports:` — stack network only
+    environment:
+      REALTIME_KIT_TOKEN: ${REALTIME_KIT_TOKEN}
+      REALTIME_KIT_ADDR: ":7890"   # not 127.0.0.1: a container's loopback is its own
+```
+
+Pack then uses `DENO_REALTIME_KIT_URL=http://realtime-kit:7890` and the same
+`${REALTIME_KIT_TOKEN}`. The LiveKit media server does not belong in this
+stack; it runs natively on its own machine (below).
+
 ### Native Linux deployment
 
-There are two different installation targets. Both are native systemd services;
-neither uses Docker.
+Without Docker, there are two different installation targets, both native
+systemd services.
 
 On every **Pack application instance**, install the lightweight gateway beside
 Pack:
